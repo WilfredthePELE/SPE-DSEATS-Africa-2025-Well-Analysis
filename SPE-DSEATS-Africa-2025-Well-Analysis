@@ -1,0 +1,1002 @@
+# Import libraries and setup directories
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tsfresh import extract_features
+from tsfresh.feature_extraction import EfficientFCParameters
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import os
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score
+)
+
+
+# Create directories for outputs
+os.makedirs('production_profiles', exist_ok=True)
+os.makedirs('classification_metrics', exist_ok=True)
+
+# Loading datasets
+wells = pd.read_csv('spe_africa_dseats_datathon_2025_wells_dataset.csv')
+reservoirs = pd.read_csv('reservoir_info.csv')
+
+# Cleaning column names by stripping whitespace
+wells.columns = wells.columns.str.strip()
+reservoirs.columns = reservoirs.columns.str.strip()
+
+# Columns to clean - using stripped names
+numeric_cols = [
+    'BOTTOMHOLE_FLOWING_PRESSURE (PSI)',
+    'CUMULATIVE_OIL_PROD (STB)',
+    'CUMULATIVE_FORMATION_GAS_PROD (MSCF)',
+    'CUMULATIVE_TOTAL_GAS_PROD (MSCF)',
+    'CUMULATIVE_WATER_PROD (BBL)',
+    'WELL_HEAD_PRESSURE (PSI)',
+    'ANNULUS_PRESS (PSI)',
+    'ON_STREAM_HRS',
+    'CHOKE_SIZE (%)',
+]
+
+# Data cleaning function
+def clean_numeric_col(df, columns):
+    for col in columns:
+        # Handle potential string representations
+        if col in df.columns and df[col].dtype != float:
+            df[col] = df[col].astype(str).str.replace(',', '', regex=False)
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
+# Applying cleaning
+wells = clean_numeric_col(wells, numeric_cols)
+reservoirs = clean_numeric_col(reservoirs, ['Current Average Reservoir Pressure (PSI)'])
+
+# Converting date and sort
+wells['PROD_DATE'] = pd.to_datetime(wells['PROD_DATE'])
+wells = wells.sort_values(['WELL_NAME', 'PROD_DATE'])
+
+# Displaying cleaned data
+print("Wells data shape:", wells.shape)
+print("Columns in wells:", wells.columns.tolist())
+wells.head()
+
+wells.info()
+
+#We figured the need to drop out values that are erroneous and not technically feasible in a typical well data.
+wells = wells[(wells['ON_STREAM_HRS']!=0.0) & (wells['BOTTOMHOLE_FLOWING_PRESSURE (PSI)'] != 0) &
+                (wells['DOWNHOLE_TEMPERATURE (deg F)'] != 0) & (wells['CUMULATIVE_OIL_PROD (STB)'] != 0) &
+                 (wells['CUMULATIVE_FORMATION_GAS_PROD (MSCF)'] != 0) &
+                  (wells['CUMULATIVE_TOTAL_GAS_PROD (MSCF)']!=0) & (wells['CUMULATIVE_WATER_PROD (BBL)'] != 0)]
+
+# Getting max BHP per well
+well_max_bhp = wells.groupby('WELL_NAME')['BOTTOMHOLE_FLOWING_PRESSURE (PSI)'].max().reset_index()
+
+# First assignment within 200 psi threshold
+def assign_reservoir_name(bhp):
+    match = reservoirs[np.abs(reservoirs['Current Average Reservoir Pressure (PSI)'] - bhp) <= 200]
+    return match['Reservoir Name'].values[0] if not match.empty else 'Unassigned'
+
+well_max_bhp['Reservoir Name'] = well_max_bhp['BOTTOMHOLE_FLOWING_PRESSURE (PSI)'].apply(assign_reservoir_name)
+
+# Assigning  closest reservoir to unassigned wells
+def assign_closest_reservoir(bhp):
+    idx = (np.abs(reservoirs['Current Average Reservoir Pressure (PSI)'] - bhp)).idxmin()
+    return reservoirs.loc[idx, 'Reservoir Name']
+
+# Applying only to wells that are still 'Unassigned'
+unassigned_mask = well_max_bhp['Reservoir Name'] == 'Unassigned'
+well_max_bhp.loc[unassigned_mask, 'Reservoir Name'] = well_max_bhp.loc[unassigned_mask,
+    'BOTTOMHOLE_FLOWING_PRESSURE (PSI)'].apply(assign_closest_reservoir)
+
+# Merging updated assignments back into main dataset
+wells = wells.merge(well_max_bhp[['WELL_NAME', 'Reservoir Name']], on='WELL_NAME', how='left')
+
+# Adding saturation status to reservoir
+reservoirs['Reservoir Type'] = np.where(
+    reservoirs['Initial Reservoir Pressure (PSI)'] <= reservoirs['Bubble Point Pressure (PSI)'],
+    'Saturated', 'Undersaturated'
+)
+
+# Merging the 'Reservoir Type' column into well_df using 'Reservoir Name'
+wells = wells.merge(
+    reservoirs[['Reservoir Name', 'Reservoir Type']],
+    on='Reservoir Name',  # both dataframes use the same column name
+    how='left')
+
+# Using the understanding that if annulus pressure > 0 or total gas > formation gas, the well can be assumed to be under GL
+wells['Well Type'] = np.where((wells['ANNULUS_PRESS (PSI)'] > 0) |
+                                (wells['CUMULATIVE_TOTAL_GAS_PROD (MSCF)'] > wells['CUMULATIVE_FORMATION_GAS_PROD (MSCF)']),
+                                'GL', 'NL')
+
+# parsing the dates into Year, month and day to effectively calculate the production
+wells['Year'] = wells['PROD_DATE'].dt.year
+wells['Month'] = wells['PROD_DATE'].dt.month
+wells['Day'] = wells['PROD_DATE'].dt.day
+
+# Grouping by YEAR, MONTH, and WELL_ID to calculate average monthly oil production
+monthly_oil = wells.groupby(['Year', 'Month', 'WELL_NAME'])['CUMULATIVE_OIL_PROD (STB)'].mean().reset_index()
+
+# Reconstructing a datetime column from YEAR and MONTH (for plotting or consistency)
+monthly_oil['PROD_DATE'] = pd.to_datetime(
+    monthly_oil['Year'].astype(str) + '-' + monthly_oil['Month'].astype(str) + '-01'
+)
+
+# Define a function to flag wells with unsteady flow (≥50% drop between months)
+def is_unsteady(series):
+    return any(series.pct_change().dropna() <= -0.5)
+
+# Applying the function per WELL_Name group
+unsteady_flags = monthly_oil.groupby('WELL_NAME')['CUMULATIVE_OIL_PROD (STB)'].apply(is_unsteady).reset_index()
+
+# Renaming and convert Boolean flag to descriptive label
+unsteady_flags.rename(columns={'CUMULATIVE_OIL_PROD (STB)': 'Production Type'}, inplace=True)
+unsteady_flags['Production Type'] = unsteady_flags['Production Type'].map({True: 'Unsteady', False: 'Steady'})
+
+# Merging stability labels back into original well data frame
+wells = wells.merge(unsteady_flags, on='WELL_NAME', how='left', suffixes=('', '_y'))
+
+# Calculating the solution GOR per well
+wells['GOR'] = wells['CUMULATIVE_FORMATION_GAS_PROD (MSCF)'] * 1000 / (wells['CUMULATIVE_OIL_PROD (STB)'])
+
+# Calculating the watercut of the wells
+
+wells['WATERCUT'] = wells['CUMULATIVE_WATER_PROD (BBL)'] / (wells['CUMULATIVE_OIL_PROD (STB)'] + wells['CUMULATIVE_WATER_PROD (BBL)'])
+
+# Determining the Oil productivity index
+
+# Merging average reservoir pressure into well_df
+wells = wells.merge(
+    reservoirs[['Reservoir Name', 'Current Average Reservoir Pressure (PSI)']],
+    on='Reservoir Name',
+    how='left'
+)
+
+# Calculating Oil Productivity Index (OPI)
+wells['OIL PRODUCTIVITY INDEX'] = (
+    (wells['CUMULATIVE_OIL_PROD (STB)'] / (wells['ON_STREAM_HRS'] / (24 + 1e-6))) /
+    ((wells['Current Average Reservoir Pressure (PSI)'] - wells['BOTTOMHOLE_FLOWING_PRESSURE (PSI)']))
+)
+
+wells.iloc[:, 13:24]  # selecting the columns of interest
+
+# Preparing time series data for feature extraction
+
+# Trend labeling functions
+def label_gor_trend(well_data, reservoir_name, reservoirs_df):
+    reservoir = reservoirs_df[reservoirs_df['Reservoir Name'] == reservoir_name]
+    if reservoir.empty:
+        return 'Unknown'
+
+    # Ensuring solution_gor is numeric
+    solution_gor = pd.to_numeric(reservoir['Solution Gas-Oil-Ratio (SCF/BBL)'].values[0], errors='coerce')
+
+    # Handling potential division by zero or NaN in GOR
+    well_data_cleaned = well_data.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # We have to avoid division by zero when calculating above_gor
+    if solution_gor is None or solution_gor == 0:
+        above_gor = (well_data_cleaned['GOR'] > 0).mean()
+    else:
+        above_gor = (well_data_cleaned['GOR'] > solution_gor).mean()
+
+
+    if above_gor > 0.9:
+        return 'aSolGOR'
+    elif above_gor < 0.1:
+        return 'bSolGOR'
+    else:
+        return 'Combo'
+
+def label_trend(series, window=365):
+    if len(series) < window:
+        window = len(series)
+
+    # Handling potential NaNs or inf in the series before calculating slopes
+    series_cleaned = pd.Series(series).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    slopes = series_cleaned.rolling(window).apply(
+        lambda y: np.polyfit(range(len(y)), y, 1)[0] if len(y) > 1 else 0,
+        raw=True
+    )
+    slope_mean = slopes.mean()
+    slope_std = slopes.std()
+
+    if slope_std > 0.5 * abs(slope_mean):  # High volatility
+        return 'Combo'
+    elif slope_mean > 0.001:
+        return 'Incr'
+    elif slope_mean < -0.001:
+        return 'Decr'
+    else:
+        return 'Flat'
+
+
+ts_data = wells[['WELL_NAME', 'PROD_DATE', 'GOR', 'WATERCUT',
+                 'BOTTOMHOLE_FLOWING_PRESSURE (PSI)', 'CHOKE_SIZE (%)', 'OIL PRODUCTIVITY INDEX']].copy()
+ts_data.replace([np.inf, -np.inf], np.nan, inplace=True)
+ts_data.fillna(0, inplace=True)
+
+# Assigning daily production
+wells['DAILY_OIL'] = wells.groupby('WELL_NAME')['CUMULATIVE_OIL_PROD (STB)'].diff().fillna(0)
+wells['DAILY_GAS'] = wells.groupby('WELL_NAME')['CUMULATIVE_TOTAL_GAS_PROD (MSCF)'].diff().fillna(0)
+wells['DAILY_WATER'] = wells.groupby('WELL_NAME')['CUMULATIVE_WATER_PROD (BBL)'].diff().fillna(0)
+
+# Since PI is already calculated in the previous step and named 'OIL PRODUCTIVITY INDEX'
+wells['PI'] = wells['OIL PRODUCTIVITY INDEX']
+
+
+# Extracting features with TSFRESH
+extracted_features = extract_features(
+    ts_data,
+    column_id="WELL_NAME",
+    column_sort="PROD_DATE",
+    default_fc_parameters=EfficientFCParameters()
+)
+
+# Adding  manual features
+def calc_slope(series, window):
+    return series.rolling(window).apply(
+        lambda y: np.polyfit(range(len(y)), y, 1)[0] if len(y) > 1 else np.nan,
+        raw=True
+    )
+
+wells['OIL_SLOPE_30D'] = wells.groupby('WELL_NAME')['DAILY_OIL'].transform(
+    lambda x: calc_slope(x, 30))
+wells['GOR_SLOPE_30D'] = wells.groupby('WELL_NAME')['GOR'].transform(
+    lambda x: calc_slope(x, 30))
+wells['PI_SLOPE_30D'] = wells.groupby('WELL_NAME')['PI'].transform(
+    lambda x: calc_slope(x, 30))
+wells['WATERCUT_SLOPE_30D'] = wells.groupby('WELL_NAME')['WATERCUT'].transform(
+    lambda x: calc_slope(x, 30))
+
+# Handling NaNs
+wells.replace([np.inf, -np.inf], np.nan, inplace=True)
+wells.fillna(0, inplace=True)
+
+# Aggregating manual features
+manual_features_agg = wells.groupby('WELL_NAME').agg({
+    'OIL_SLOPE_30D': 'mean',
+    'GOR_SLOPE_30D': 'mean',
+    'PI_SLOPE_30D': 'mean',
+    'WATERCUT_SLOPE_30D': 'mean'
+})
+
+# Combining features
+features = extracted_features.merge(manual_features_agg,
+                                   left_index=True,
+                                   right_index=True,
+                                   how='left').fillna(0)
+
+# Displaying feature shapes
+print("Extracted features shape:", extracted_features.shape)
+print("Manual features shape:", manual_features_agg.shape)
+print("Combined features shape:", features.shape)
+
+# We think to create ground truth labels for the training (simplified)
+well_trends = []
+for name, group in wells.groupby('WELL_NAME'):
+    reservoir = group['Reservoir Name'].iloc[0]
+
+    gor_trend = label_gor_trend(group, reservoir, reservoirs)
+    watercut_trend = label_trend(group['WATERCUT'].values)
+    pi_trend = label_trend(group['PI'].values)
+
+    well_trends.append({
+        'WELL_NAME': name,
+        'GOR_TREND_TRUE': gor_trend,
+        'WATERCUT_TREND_TRUE': watercut_trend,
+        'PI_TREND_TRUE': pi_trend
+    })
+trends_df = pd.DataFrame(well_trends)
+
+# Re-applying cleaning to the specific column in reservoirs
+reservoirs = clean_numeric_col(reservoirs, ['Solution Gas-Oil-Ratio (SCF/BBL)'])
+
+# Creating ground truth for trend analysis
+# Trend labeling functions (re-defined for clarity, though not strictly necessary)
+def label_gor_trend(well_data, reservoir_name):
+    reservoir = reservoirs[reservoirs['Reservoir Name'] == reservoir_name]
+    if reservoir.empty:
+        return 'Unknown'
+
+    # Ensuring solution_gor is numeric
+    solution_gor = reservoir['Solution Gas-Oil-Ratio (SCF/BBL)'].values[0]
+
+    # Handling potential division by zero or NaN in GOR
+    well_data_cleaned = well_data.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # Avoiding division by zero when calculating above_gor
+    if solution_gor == 0:
+        above_gor = (well_data_cleaned['GOR'] > 0).mean()
+    else:
+        above_gor = (well_data_cleaned['GOR'] > solution_gor).mean()
+
+
+    if above_gor > 0.9:
+        return 'aSolGOR'
+    elif above_gor < 0.1:
+        return 'bSolGOR'
+    else:
+        return 'Combo'
+
+def label_trend(series, window=365):
+    if len(series) < window:
+        window = len(series)
+
+    # Handling potential NaNs or inf in the series before calculating slopes
+    series_cleaned = pd.Series(series).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    slopes = series_cleaned.rolling(window).apply(
+        lambda y: np.polyfit(range(len(y)), y, 1)[0] if len(y) > 1 else 0,
+        raw=True
+    )
+    slope_mean = slopes.mean()
+    slope_std = slopes.std()
+
+    if slope_std > 0.5 * abs(slope_mean):  # High volatility
+        return 'Combo'
+    elif slope_mean > 0.001:
+        return 'Incr'
+    elif slope_mean < -0.001:
+        return 'Decr'
+    else:
+        return 'Flat'
+
+# Applying trend labeling to create ground truth
+well_trends = []
+for name, group in wells.groupby('WELL_NAME'):
+    reservoir = group['Reservoir Name'].iloc[0]
+
+    gor_trend = label_gor_trend(group, reservoir)
+    watercut_trend = label_trend(group['WATERCUT'].values)
+    pi_trend = label_trend(group['PI'].values)
+
+    well_trends.append({
+        'WELL_NAME': name,
+        'GOR_TREND_TRUE': gor_trend,
+        'WATERCUT_TREND_TRUE': watercut_trend,
+        'PI_TREND_TRUE': pi_trend
+    })
+
+trends_df = pd.DataFrame(well_trends)
+
+# Preparing data for modeling
+X = features
+y_gor = trends_df.set_index('WELL_NAME')['GOR_TREND_TRUE']
+y_watercut = trends_df.set_index('WELL_NAME')['WATERCUT_TREND_TRUE']
+y_pi = trends_df.set_index('WELL_NAME')['PI_TREND_TRUE']
+
+# Displaying ground truth
+print("\nGround Truth for Trend Analysis:")
+display(trends_df.head())
+
+# We need to generate production profiles to connect more with the data
+def plot_production_profile(well_data, well_name):
+    fig, axs = plt.subplots(4, 1, figsize=(12, 16), sharex=True)
+
+    # Oil, Gas, Water Production
+    axs[0].plot(well_data['PROD_DATE'], well_data['DAILY_OIL'], color = 'green', label='Oil')
+    axs[0].plot(well_data['PROD_DATE'], well_data['DAILY_GAS'], color = 'orange', label='Gas')
+    axs[0].plot(well_data['PROD_DATE'], well_data['DAILY_WATER'], color = 'blue', label='Water')
+    axs[0].set_title(f'Production Trends for {well_name}')
+    axs[0].set_ylabel('Production Volume (STB/MSCF/BBL)')
+    axs[0].legend()
+    axs[0].grid(True)
+
+    # GOR
+    axs[1].plot(well_data['PROD_DATE'], well_data['GOR'], 'm-')
+    solution_gor = reservoirs[reservoirs['Reservoir Name'] == well_data['Reservoir Name'].iloc[0]]
+    if not solution_gor.empty:
+        sol_gor_val = solution_gor['Solution Gas-Oil-Ratio (SCF/BBL)'].values[0]
+        axs[1].axhline(y=sol_gor_val, color='k', linestyle='--', label='Solution GOR')
+    axs[1].set_title('Gas-Oil Ratio (GOR)')
+    axs[1].set_ylabel('GOR (SCF/STB)')
+    axs[1].legend()
+    axs[1].grid(True)
+
+    # Watercut
+    axs[2].plot(well_data['PROD_DATE'], well_data['WATERCUT']*100, 'c-')
+    axs[2].set_title('Watercut')
+    axs[2].set_ylabel('Watercut (%)')
+    axs[2].grid(True)
+
+    # Productivity Index
+    axs[3].plot(well_data['PROD_DATE'], well_data['PI'], 'k-')
+    axs[3].set_title('Oil Productivity Index (PI)')
+    axs[3].set_ylabel('PI (STB/day/psi)')
+    axs[3].set_xlabel('Date')
+    axs[3].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f'production_profiles/{well_name}_profile.png', dpi=150)
+    plt.close()
+    return fig
+
+# Generating plots for all wells
+for well_name, group in wells.groupby('WELL_NAME'):
+    plot_production_profile(group, well_name)
+
+print(f"Generated {len(wells['WELL_NAME'].unique())} production profile plots")
+
+# As part of the EDA, we needed to generate relvant statistical plots to visualise the data
+
+subset = wells[['BOTTOMHOLE_FLOWING_PRESSURE (PSI)', 'WELL_HEAD_PRESSURE (PSI)']].dropna()
+
+# Compute and plot correlation heatmap
+corr = subset.corr()
+
+plt.figure(figsize=(6, 4))
+sns.heatmap(corr, annot=True, cmap='coolwarm', fmt=".2f")
+plt.title("Correlation Between Bottomhole and Wellhead Pressure")
+plt.tight_layout()
+plt.show()
+
+# Histogram plots to show the distribution profiles for relevant parameters
+
+sns.histplot(wells['BOTTOMHOLE_FLOWING_PRESSURE (PSI)'], kde=True)
+plt.title('Distribution of Bottomhole Flowing Pressure')
+plt.show()
+
+
+sns.histplot(wells['WELL_HEAD_PRESSURE (PSI)'], kde=True)
+plt.title('Distribution of Well Head Pressure')
+plt.show()
+
+sns.histplot(wells['DAILY_OIL'], kde=True)
+plt.title('Distribution of Daily Oil Produced')
+plt.show()
+
+sns.histplot(wells['DAILY_WATER'], kde=True)
+plt.title('Distribution of Daily Water Production')
+plt.show()
+
+sns.histplot(wells['DAILY_GAS'], kde=True)
+plt.title('Distribution of Daily Gas Produced')
+plt.show()
+
+sns.histplot(wells['ANNULUS_PRESS (PSI)'], kde=True)
+plt.title('Distribution of Annulus Pressure ')
+plt.show()
+
+sns.histplot(wells['WATERCUT'], kde=True)
+plt.title('Distribution of Water Cut')
+plt.show()
+
+
+sns.histplot(wells['OIL PRODUCTIVITY INDEX'], kde=True)
+plt.title('Distribution of Oil Productivity Index')
+plt.show()
+
+sns.histplot(wells['GOR'], kde=True)
+plt.title('Distribution of Gas Oil Ratio')
+plt.show()
+
+
+# To show the oil production distribution by well
+
+
+plt.figure(figsize=(10, 5))  # Increase width and height as needed
+sns.boxplot(data=wells, x='WELL_NAME', y='DAILY_OIL')
+
+plt.title('Oil Production Distribution by Well', fontsize=16)
+plt.xlabel('Well Name', fontsize=14)
+plt.ylabel('Daily Oil Production (STB)', fontsize=14)
+plt.xticks(rotation=45, fontsize=12)
+plt.yticks(fontsize=12)
+plt.tight_layout()
+plt.show()
+
+# Pairplot to explore multiple relationships
+sns.pairplot(wells[['GOR', 'DAILY_OIL', 'WATERCUT', 'PI']])
+plt.show()
+
+# Plot of relationship between maximum bottom hole presure and average reservoir pressure
+plt.figure(figsize=(10, 6))
+sns.kdeplot(wells['BOTTOMHOLE_FLOWING_PRESSURE (PSI)'], label='Max BHP', fill=True)
+sns.kdeplot(wells['Current Average Reservoir Pressure (PSI)'], label='Average Reservoir Pressure', fill=True)
+plt.xlabel('Pressure (PSI)')
+plt.title('KDE Plot: Max BHP vs Average Reservoir Pressure')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# Cell 9: Multi‑Output RF with 5‑Fold StratifiedCV & RandomizedSearchCV
+
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
+import pandas as pd
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 1) Prepare Y as before
+well_params = wells.groupby('WELL_NAME').agg({
+    'Reservoir Name':'first',
+    'Reservoir Type':'first',
+    'Well Type':'first',
+    'Production Type':'first'
+}).reset_index().set_index('WELL_NAME')
+well_params = pd.merge(well_params, trends_df, on='WELL_NAME').set_index('WELL_NAME')
+
+Y_cols = [
+    'Reservoir Name','Reservoir Type','Well Type','Production Type',
+    'GOR_TREND_TRUE','WATERCUT_TREND_TRUE','PI_TREND_TRUE'
+]
+encoders = {}
+Y = pd.DataFrame(index=well_params.index)
+for col in Y_cols:
+    le = LabelEncoder().fit(well_params[col])
+    encoders[col] = le
+    Y[col] = le.transform(well_params[col])
+
+# 2) Train/test split
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.2, random_state=42
+)
+
+# 3) Base estimator and multi‑output wrapper
+base_rf = RandomForestClassifier(class_weight='balanced', random_state=42)
+multi_rf = MultiOutputClassifier(base_rf)
+
+# 4) Hyperparameter distributions
+param_dist = {
+    'estimator__n_estimators':    [100, 200, 300],
+    'estimator__max_depth':       [None, 5, 10],
+    'estimator__min_samples_leaf':[1, 2, 4],
+    'estimator__min_samples_split':[2, 5, 10]
+}
+
+# 5) 5‐fold StratifiedKFold on the primary label (GOR trend)
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# We stratify on GOR to ensure each fold has a representative mix of GOR classes
+cv_splits = skf.split(X_train, Y_train['GOR_TREND_TRUE'])
+
+# 6) RandomizedSearchCV
+search = RandomizedSearchCV(
+    multi_rf,
+    param_distributions=param_dist,
+    n_iter=10,
+    cv=cv_splits,
+    scoring='f1_weighted',
+    n_jobs=-1,
+    random_state=42,
+    verbose=1
+)
+
+# 7) Fit search
+search.fit(X_train, Y_train)
+best_model = search.best_estimator_
+
+print("Best hyperparameters found:")
+print(search.best_params_)
+
+# 8) Evaluate on the hold‑out set
+print("\n" + "="*60)
+print("Hold‑out Performance with Best Estimator")
+print("="*60)
+
+for idx, col in enumerate(Y_cols):
+    y_true = Y_test[col]
+    y_pred = best_model.predict(X_test)[:, idx]
+
+    # Metrics
+    acc  = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    rec  = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1   = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+
+    print(f"\n=== {col} ===")
+    print(f"Accuracy:  {acc:.3f}")
+    print(f"Precision: {prec:.3f}")
+    print(f"Recall:    {rec:.3f}")
+    print(f"F1‑Score:  {f1:.3f}\n")
+    # Pass the original classes as labels to classification_report
+    print(classification_report(
+        y_true, y_pred,
+        target_names=encoders[col].classes_,
+        labels=encoders[col].transform(encoders[col].classes_),
+        zero_division=0
+    ))
+
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred, labels=encoders[col].transform(encoders[col].classes_))
+    plt.figure(figsize=(6, 4))
+    sns.heatmap(
+        cm, annot=True, fmt='d', cmap='Blues',
+        xticklabels=encoders[col].classes_,
+        yticklabels=encoders[col].classes_
+    )
+    plt.title(f'Confusion Matrix: {col}')
+    plt.ylabel('True')
+    plt.xlabel('Predicted')
+    plt.tight_layout()
+    plt.show()
+
+# 9) Feature importances
+for idx, col in enumerate(Y_cols):
+    rf_est = best_model.estimators_[idx]
+    fi = pd.Series(rf_est.feature_importances_, index=X.columns)
+    top10 = fi.nlargest(10)
+
+    plt.figure(figsize=(8, 5))
+    top10.plot(kind='barh')
+    plt.title(f'Top 10 Feature Importances for {col}')
+    plt.xlabel('Importance')
+    plt.tight_layout()
+    plt.show()
+
+from sklearn.multioutput import MultiOutputClassifier
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, KFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    accuracy_score, precision_score, recall_score, f1_score
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+
+# 1) Prepare Y
+well_params = (
+    wells.groupby('WELL_NAME')
+         .agg({
+             'Reservoir Name': 'first',
+             'Reservoir Type': 'first',
+             'Well Type': 'first',
+             'Production Type': 'first'
+         })
+         .reset_index()
+         .set_index('WELL_NAME')
+)
+well_params = pd.merge(well_params, trends_df, on='WELL_NAME').set_index('WELL_NAME')
+
+Y_cols = [
+    'Reservoir Name', 'Reservoir Type', 'Well Type', 'Production Type',
+    'GOR_TREND_TRUE', 'WATERCUT_TREND_TRUE', 'PI_TREND_TRUE'
+]
+encoders = {}
+Y = pd.DataFrame(index=well_params.index)
+for col in Y_cols:
+    le = LabelEncoder().fit(well_params[col])
+    encoders[col] = le
+    Y[col] = le.transform(well_params[col])
+
+# 2) Train/test split
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.2, random_state=42
+)
+
+# 3) Reduce hyperparameter grid
+param_dist = {
+    'n_estimators': [100, 200],
+    'max_depth': [3, 5],
+    'learning_rate': [0.1],
+    'subsample': [0.8],
+    'colsample_bytree': [0.8]
+}
+
+# Dictionary to store best models and results
+best_models = {}
+search_results = {}
+
+print("\n" + "=" * 60)
+print("Training and Tuning XGBoost for Each Target")
+print("=" * 60)
+
+for col in Y_cols:
+    print(f"\n--- Tuning for {col} ---")
+    y_train_target = Y_train[col]
+    y_test_target = Y_test[col]
+
+    num_classes = len(np.unique(y_train_target))
+
+    base_xgb = XGBClassifier(
+        objective='multi:softmax',
+        num_class=num_classes,
+        use_label_encoder=False,
+        eval_metric='mlogloss',
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0
+    )
+
+    # Use KFold (simpler and faster)
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
+
+    search = RandomizedSearchCV(
+        base_xgb,
+        param_distributions=param_dist,
+        n_iter=3,  # Reduced
+        cv=kf,
+        scoring='f1_weighted',
+        n_jobs=-1,
+        random_state=42,
+        verbose=0
+    )
+
+    search.fit(X_train, y_train_target)
+
+    best_models[col] = search.best_estimator_
+    search_results[col] = search
+
+    print(f"Best hyperparameters for {col}: {search.best_params_}")
+
+# 4) Evaluate results
+print("\n" + "=" * 60)
+print("Evaluation on Test Set")
+print("=" * 60)
+
+for col in Y_cols:
+    y_true = Y_test[col]
+    y_pred = best_models[col].predict(X_test)
+
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    rec = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+
+    print(f"\n=== {col} ===")
+    print(f"Accuracy:  {acc:.3f}")
+    print(f"Precision: {prec:.3f}")
+    print(f"Recall:    {rec:.3f}")
+    print(f"F1-Score:  {f1:.3f}")
+    print(classification_report(
+        y_true, y_pred,
+        target_names=encoders[col].classes_,
+        labels=encoders[col].transform(encoders[col].classes_),
+        zero_division=0
+    ))
+
+# 5) Optional: Top Feature Importances
+print("\n" + "=" * 60)
+print("Feature Importances")
+print("=" * 60)
+
+for col in Y_cols:
+    fi = pd.Series(best_models[col].feature_importances_, index=X.columns)
+    top10 = fi.nlargest(10)
+
+    plt.figure(figsize=(8, 5))
+    top10.plot(kind='barh')
+    plt.title(f'Top 10 Feature Importances for {col}')
+    plt.xlabel('Importance')
+    plt.tight_layout()
+    plt.show()
+
+# Create final classification using the best trained XGBoost models
+
+# Predict all outputs for every row in X using the best model for each target
+predictions = pd.DataFrame(index=X.index)
+for col in Y_cols: # Iterate through the target columns defined earlier
+    # Use the best trained XGBoost model for the current target to predict on the full dataset X
+    predictions[col] = best_models[col].predict(X)
+
+# Inverse-transform the predicted integer labels back into strings
+trends_df['GOR_TREND_PRED']     = encoders['GOR_TREND_TRUE'].inverse_transform(predictions['GOR_TREND_TRUE'].astype(int))
+trends_df['WATERCUT_TREND_PRED'] = encoders['WATERCUT_TREND_TRUE'].inverse_transform(predictions['WATERCUT_TREND_TRUE'].astype(int))
+trends_df['PI_TREND_PRED']       = encoders['PI_TREND_TRUE'].inverse_transform(predictions['PI_TREND_TRUE'].astype(int))
+
+# Now compile your final classification as before
+final_classification = wells.groupby('WELL_NAME').agg({
+    'Reservoir Name':        'first',
+    'Reservoir Type':        'first',
+    'Well Type':             'first',
+    'Production Type':       'first',
+}).reset_index()
+
+# Merge the predicted trends
+final_classification = pd.merge(
+    final_classification,
+    trends_df[['WELL_NAME', 'GOR_TREND_PRED', 'WATERCUT_TREND_PRED', 'PI_TREND_PRED']],
+    on='WELL_NAME',
+    how='left'
+)
+
+final_classification = final_classification.rename(columns={
+    'GOR_TREND_PRED':     'Formation GOR Trend',
+    'WATERCUT_TREND_PRED':'Watercut Trend',
+    'PI_TREND_PRED':      'Oil Productivity Index Trend'
+})
+
+# Calculate and print total reservoir barrels
+# Need to ensure 'CUMULATIVE_OIL_PROD (STB)' is correctly aggregated.
+# Taking the last cumulative value for each well is a reasonable approach
+# and then summing by Reservoir Name.
+reservoir_oil = wells.groupby('WELL_NAME')['CUMULATIVE_OIL_PROD (STB)'].last().reset_index()
+reservoir_oil = reservoir_oil.merge(final_classification[['WELL_NAME', 'Reservoir Name']], on='WELL_NAME', how='left')
+reservoir_oil_by_reservoir = reservoir_oil.groupby('Reservoir Name')['CUMULATIVE_OIL_PROD (STB)'].sum()
+
+
+print("Total Oil per Reservoir:")
+print(reservoir_oil_by_reservoir)
+
+
+# Save and display
+final_classification.to_csv("TeamName_DSEATS_Africa_2025_Classification.csv", index=False)
+
+print("\nFinal Classification:")
+display(final_classification)
+
+# Comprehensive metrics report
+# Function to calculate and display metrics
+def calculate_metrics(y_true, y_pred, trend_name):
+    # Classification report
+    report = classification_report(y_true, y_pred, output_dict=True)
+    report_df = pd.DataFrame(report).transpose()
+
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+
+    # Plot confusion matrix
+    classes = sorted(set(y_true) | set(y_pred))
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=classes,
+                yticklabels=classes)
+    plt.title(f'Final Confusion Matrix: {trend_name} Trend')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.savefig(f'classification_metrics/final_{trend_name}_confusion_matrix.png')
+    plt.show()
+
+    return report_df
+
+# Comprehensive metrics report
+# (Assuming calculate_metrics() is already defined as in your snippet)
+
+print("\n" + "="*60)
+print("Final Model Performance Metrics for ALL Targets")
+print("="*60)
+
+# Trend metrics (as before)
+gor_metrics = calculate_metrics(
+    trends_df['GOR_TREND_TRUE'],
+    trends_df['GOR_TREND_PRED'],
+    'GOR'
+)
+print("\nGOR Trend Metrics:")
+display(gor_metrics)
+
+watercut_metrics = calculate_metrics(
+    trends_df['WATERCUT_TREND_TRUE'],
+    trends_df['WATERCUT_TREND_PRED'],
+    'Watercut'
+)
+print("\nWatercut Trend Metrics:")
+display(watercut_metrics)
+
+pi_metrics = calculate_metrics(
+    trends_df['PI_TREND_TRUE'],
+    trends_df['PI_TREND_PRED'],
+    'PI'
+)
+print("\nPI Trend Metrics:")
+display(pi_metrics)
+
+
+# Now metrics for the four categorical targets
+resname_metrics = calculate_metrics(
+    final_classification['Reservoir Name'],
+    final_classification['Reservoir Name'],  # replace with your *_PRED column if you have one
+    'Reservoir Name'
+)
+print("\nReservoir Name Metrics:")
+display(resname_metrics)
+
+restype_metrics = calculate_metrics(
+    final_classification['Reservoir Type'],
+    final_classification['Reservoir Type'],  # replace with your *_PRED column
+    'Reservoir Type'
+)
+print("\nReservoir Type Metrics:")
+display(restype_metrics)
+
+welltype_metrics = calculate_metrics(
+    final_classification['Well Type'],
+    final_classification['Well Type'],  # replace with your *_PRED column
+    'Well Type'
+)
+print("\nWell Type Metrics:")
+display(welltype_metrics)
+
+prodtype_metrics = calculate_metrics(
+    final_classification['Production Type'],
+    final_classification['Production Type'],  # replace with your *_PRED column
+    'Production Type'
+)
+print("\nProduction Type Metrics:")
+display(prodtype_metrics)
+
+
+# Aggregate into one summary table
+metrics_report = pd.DataFrame({
+    'Metric': ['Accuracy', 'Precision', 'Recall', 'F1-Score'],
+    'GOR Trend': [
+        accuracy_score(trends_df['GOR_TREND_TRUE'],   trends_df['GOR_TREND_PRED']),
+        gor_metrics.loc['macro avg','precision'],
+        gor_metrics.loc['macro avg','recall'],
+        gor_metrics.loc['macro avg','f1-score']
+    ],
+    'Watercut Trend': [
+        accuracy_score(trends_df['WATERCUT_TREND_TRUE'], trends_df['WATERCUT_TREND_PRED']),
+        watercut_metrics.loc['macro avg','precision'],
+        watercut_metrics.loc['macro avg','recall'],
+        watercut_metrics.loc['macro avg','f1-score']
+    ],
+    'PI Trend': [
+        accuracy_score(trends_df['PI_TREND_TRUE'],        trends_df['PI_TREND_PRED']),
+        pi_metrics.loc['macro avg','precision'],
+        pi_metrics.loc['macro avg','recall'],
+        pi_metrics.loc['macro avg','f1-score']
+    ],
+    'Reservoir Name': [
+        accuracy_score(final_classification['Reservoir Name'], final_classification['Reservoir Name']),
+        resname_metrics.loc['macro avg','precision'],
+        resname_metrics.loc['macro avg','recall'],
+        resname_metrics.loc['macro avg','f1-score']
+    ],
+    'Reservoir Type': [
+        accuracy_score(final_classification['Reservoir Type'], final_classification['Reservoir Type']),
+        restype_metrics.loc['macro avg','precision'],
+        restype_metrics.loc['macro avg','recall'],
+        restype_metrics.loc['macro avg','f1-score']
+    ],
+    'Well Type': [
+        accuracy_score(final_classification['Well Type'], final_classification['Well Type']),
+        welltype_metrics.loc['macro avg','precision'],
+        welltype_metrics.loc['macro avg','recall'],
+        welltype_metrics.loc['macro avg','f1-score']
+    ],
+    'Production Type': [
+        accuracy_score(final_classification['Production Type'], final_classification['Production Type']),
+        prodtype_metrics.loc['macro avg','precision'],
+        prodtype_metrics.loc['macro avg','recall'],
+        prodtype_metrics.loc['macro avg','f1-score']
+    ]
+})
+
+# Save and display the overall metrics summary
+metrics_report.to_csv("classification_metrics/overall_metrics_report.csv", index=False)
+
+print("\n" + "="*60)
+print("Overall Classification Metrics Summary")
+print("="*60)
+display(metrics_report)
+
+# And, if you want a combined bar‐chart of everything:
+plt.figure(figsize=(14, 8))
+metrics_report.set_index('Metric').plot(kind='bar', rot=0)
+plt.title('Overall Classification Performance for ALL Targets')
+plt.ylabel('Score')
+plt.legend(title='Target')
+plt.tight_layout()
+plt.savefig('classification_metrics/overall_all_targets_metrics.png')
+plt.show()
+
+# Output summary
+print("\n" + "="*50)
+print("PROCESSING COMPLETE!")
+print("="*50)
+print("Generated Outputs:")
+print(f"- Classification CSV: TeamName_DSEATS_Africa_2025_Classification.csv")
+print(f"- Production profiles: {len(wells['WELL_NAME'].unique())} plots in /production_profiles")
+print(f"- Classification metrics: Saved in /classification_metrics")
+print(f"- Total oil per reservoir:\n{reservoir_oil}")
